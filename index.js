@@ -25,7 +25,7 @@ const USER_AGENTS = [
 ];
 
 // ========== Tokens ==========
-const TOKEN_PINTEREST = process.env.TOKEN_PINTEREST ||'g4MzE4MzY5Mzg2NA.GLw68H.hDnOI0L1fcnfiXqYWrSQb6wTUhzh0mr-wOVXg4';
+const TOKEN_PINTEREST = process.env.TOKEN_PINTEREST;
 const CLIENT_ID       = process.env.CLIENT_ID || '1481717883183693864';
 
 if (!TOKEN_PINTEREST) {
@@ -35,6 +35,7 @@ if (!TOKEN_PINTEREST) {
 
 // ========== Channel IDs ==========
 const PINTEREST_CHANNEL_ID = '1484325879764226109';
+const REQUEST_CHANNEL_ID   = ''; // ← ضع هنا ID الروم المخصص لاستقبال روابط Pinterest
 
 // ========== Developer IDs ==========
 const DEVELOPER_IDS = ['1384688131374317598', '1471245404501839966'];
@@ -65,7 +66,7 @@ let autoExpandedKeywords = new Set(); // tracks which keywords were added by aut
 
 // In-memory queue of { url, keyword } items ready to post
 let imageQueue    = [];
-let isFetching    = false;
+let _fillQueuePromise = null;
 
 // URLs that failed all download retries — skip them permanently this session
 const failedUrls  = new Set();
@@ -426,14 +427,23 @@ async function checkKeywordRelevance(originalKeyword, expandedKeyword, threshold
 
 // ========== Queue Filler ==========
 // Fetches pages for all keywords in parallel and adds fresh URLs to imageQueue.
+// Promise-based dedup: concurrent callers wait for the same in-progress fill.
 async function fillQueue() {
-    if (isFetching) return;
-    isFetching = true;
+    if (_fillQueuePromise) return _fillQueuePromise;
+    _fillQueuePromise = _doFillQueue();
+    try {
+        return await _fillQueuePromise;
+    } finally {
+        _fillQueuePromise = null;
+    }
+}
+
+async function _doFillQueue() {
     console.log(`🔃 Filling queue (current: ${imageQueue.length}) ...`);
 
     try {
         const needed = QUEUE_TARGET - imageQueue.length;
-        if (needed <= 0) { isFetching = false; return; }
+        if (needed <= 0) return;
 
         // If auto-expand is on, discover guided search variants and add new ones before fetching
         if (autoExpand) {
@@ -491,8 +501,6 @@ async function fillQueue() {
         saveState();
     } catch (err) {
         console.error(`❌ fillQueue error: ${err.message}`);
-    } finally {
-        isFetching = false;
     }
 }
 
@@ -509,7 +517,7 @@ async function fetchOneKeyword(keyword, needed = QUEUE_TARGET) {
 
         try {
             const { items, nextBookmark } = await withRetry(
-                (attempt) => fetchPinterestPage(keyword, attempt === 0 ? bookmark : null),
+                () => fetchPinterestPage(keyword, bookmark),
                 4
             );
 
@@ -606,17 +614,26 @@ async function downloadImage(url) {
     for (const tryUrl of urlsToTry) {
         try {
             return await withRetry(async () => {
+                const ua = randomUA();
                 const response = await axios({
                     url: tryUrl,
                     method: 'GET',
                     responseType: 'arraybuffer',
                     headers: {
-                        'User-Agent': randomUA(),
-                        'Accept': 'image/png,image/gif,image/jpeg,image/webp,*/*',
+                        'User-Agent':      ua,
+                        'Accept':          'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+                        'Accept-Language': 'en-US,en;q=0.9',
                         'Accept-Encoding': 'gzip, deflate, br',
-                        'Referer': 'https://www.pinterest.com/',
+                        'Referer':         'https://www.pinterest.com/',
+                        'sec-fetch-dest':  'image',
+                        'sec-fetch-mode':  'no-cors',
+                        'sec-fetch-site':  'cross-site',
+                        'DNT':             '1',
+                        'Cache-Control':   'no-cache',
+                        'Pragma':          'no-cache',
                     },
                     timeout: 30000,
+                    maxRedirects: 5,
                 });
                 const buffer = Buffer.from(response.data);
                 const format = getImageFormat(tryUrl, buffer);
@@ -630,15 +647,51 @@ async function downloadImage(url) {
     throw lastErr;
 }
 
+// ========== Request Channel Helpers ==========
+
+// Follow a pin.it short URL to get the full pinterest.com URL
+async function resolvePinUrl(url) {
+    if (!url.includes('pin.it/')) return url;
+    try {
+        const res = await axios.get(url, {
+            maxRedirects: 10,
+            timeout: 10000,
+            headers: { 'User-Agent': randomUA() },
+            validateStatus: () => true,
+        });
+        return res.request?.res?.responseUrl ?? url;
+    } catch { return url; }
+}
+
+// Extract pin ID from a pinterest.com/pin/ID/ URL
+function extractPinId(url) {
+    const m = url.match(/\/pin\/(\d+)/);
+    return m ? m[1] : null;
+}
+
+// Fetch a single Pinterest pin's full data by pin ID
+async function fetchPinById(pinId) {
+    const ua   = randomUA();
+    const data = JSON.stringify({ options: { id: pinId, field_set_key: 'detailed' }, context: {} });
+    const apiUrl = `https://www.pinterest.com/resource/PinResource/get/?source_url=${encodeURIComponent(`/pin/${pinId}/`)}&data=${encodeURIComponent(data)}`;
+    const res = await withRetry(() => axios.get(apiUrl, {
+        timeout: 15000,
+        headers: { ...pinterestHeaders(ua, ''), Referer: `https://www.pinterest.com/pin/${pinId}/` },
+    }), 3);
+    const pin = res.data?.resource_response?.data;
+    if (!pin) throw new Error('لم يتم العثور على بيانات الصورة');
+    return pin;
+}
+
 // ========== Image Update ==========
 // ── Carousel embed helpers ────────────────────────────────────
+
 function buildCarouselEmbed(cdnUrl, keyword, page, total) {
     return new EmbedBuilder()
         .setTitle('Avatars — Pinterest')
         .setDescription(`🔍 \`${keyword}\``)
         .setImage(cdnUrl)
-        .setColor('#E60023')
-        .setFooter({ text: `🖼️  ${page + 1} / ${total}` });
+        .setColor('#E60023');
 }
 
 function buildCarouselComponents(msgId, page, total) {
@@ -656,7 +709,7 @@ function buildCarouselComponents(msgId, page, total) {
         new ButtonBuilder()
             .setCustomId(`c_next_${msgId}`)
             .setLabel('التالي ▶')
-            .setStyle(ButtonStyle.Primary)
+            .setStyle(ButtonStyle.Secondary)
             .setDisabled(page === total - 1),
     )];
 }
@@ -717,12 +770,62 @@ async function updatePinterestAvatar() {
         }
         if (files.length === 0) { console.error('❌ All carousel images failed'); return; }
 
-        // Upload all files first to obtain permanent Discord CDN URLs
-        const sent = await channel.send({ files });
-        const cdnUrls = [...sent.attachments.values()].map(a => a.url);
-        const total   = cdnUrls.length;
+        // Only 1 image survived — send as a regular single-image post (no carousel)
+        if (files.length === 1) {
+            const imgFile = files[0];
+            const imgName = imgFile.name;
+            const sent = await channel.send({
+                embeds: [new EmbedBuilder()
+                    .setTitle('Avatar — Pinterest')
+                    .setDescription(`🔍 \`${item.keyword}\``)
+                    .setImage(`attachment://${imgName}`)
+                    .setColor('#E60023')
+                ],
+                files: [imgFile],
+            });
+            const att = sent.attachments.find(a => a.name === imgName);
+            if (att) {
+                await sent.edit({
+                    embeds: [new EmbedBuilder()
+                        .setTitle('Avatar — Pinterest')
+                        .setDescription(`🔍 \`${item.keyword}\``)
+                        .setURL(att.url)
+                        .setImage(`attachment://${imgName}`)
+                        .setColor('#E60023')
+                    ],
+                    components: [new ActionRowBuilder().addComponents(
+                        new ButtonBuilder().setLabel('🖼️ Image').setURL(att.url).setStyle(ButtonStyle.Link)
+                    )],
+                });
+            }
+            console.log(`✅ Sent (single fallback) | queue: ${imageQueue.length}`);
+            saveState();
+            return;
+        }
 
-        // Edit the message to show paginated embed (page 1) + nav buttons
+        // Send all files with a placeholder embed (no attachment:// reference)
+        // so every file appears in sent.attachments and none gets "consumed" by the embed
+        const SPOILER_TEXT = '|| بسبب مدة انتهى ازرار تفاعلية بمدة محدودة نسهل عليكم البحث بدل ما يقولو لك كاروسيل منتهي ||';
+
+        const sent = await channel.send({
+            content: SPOILER_TEXT,
+            embeds: [new EmbedBuilder()
+                .setTitle('Avatars — Pinterest')
+                .setDescription(`🔍 \`${item.keyword}\``)
+                .setColor('#E60023')
+            ],
+            components: buildCarouselComponents('placeholder', 0, files.length),
+            files,
+        });
+
+        // Map CDN URLs to original file order — Discord may return attachments out of order
+        const attByName = new Map([...sent.attachments.values()].map(a => [a.name, a.url]));
+        const cdnUrls   = files.map(f => attByName.get(f.name)).filter(Boolean);
+        const total     = cdnUrls.length;
+
+        if (total === 0) { console.error('❌ No CDN URLs resolved after send'); return; }
+
+        // Edit to add the image and correct page count to the embed
         await sent.edit({
             embeds:     [buildCarouselEmbed(cdnUrls[0], item.keyword, 0, total)],
             components: buildCarouselComponents(sent.id, 0, total),
@@ -730,7 +833,19 @@ async function updatePinterestAvatar() {
 
         // Store session for button interactions (auto-expire after 30 min)
         carouselSessions.set(sent.id, { cdnUrls, page: 0, keyword: item.keyword, total });
-        setTimeout(() => carouselSessions.delete(sent.id), 30 * 60 * 1000);
+        const _expireMsgId  = sent.id;
+        const _expireChanId = sent.channelId;
+        setTimeout(async () => {
+            carouselSessions.delete(_expireMsgId);
+            try {
+                const ch  = await pinterestBot.channels.fetch(_expireChanId);
+                const msg = await ch.messages.fetch(_expireMsgId);
+                await msg.edit({
+                    content: '|| بسبب مدة انتهى ازرار تفاعلية بمدة محدودة نسهل عليكم البحث بدل ما يقولو لك كاروسيل منتهي ||',
+                    components: [],
+                });
+            } catch (err) { console.warn(`⚠️ Carousel expire edit failed: ${err.message}`); }
+        }, 30 * 60 * 1000);
 
         console.log(`✅ Carousel sent (${total} images, paginated) | queue: ${imageQueue.length}`);
         saveState();
@@ -931,39 +1046,45 @@ async function fetchPinterestGuides(keyword) {
 
     try {
         const ua = randomUA();
-        const source_url = `/search/pins/?q=${encodeURIComponent(keyword)}&rs=typed`;
         const payload = JSON.stringify({
-            options: { query: keyword, scope: 'pins' },
+            options: { query: keyword, scope: 'pins', count: 10 },
             context: {}
         });
-        const url = `https://www.pinterest.com/resource/GuideSearchResource/get/?source_url=${encodeURIComponent(source_url)}&data=${encodeURIComponent(payload)}`;
+        const url = `https://www.pinterest.com/resource/TypeaheadResource/get/?source_url=%2F&data=${encodeURIComponent(payload)}`;
 
         const res = await axios.get(url, {
             timeout: 15000,
-            headers: pinterestHeaders(ua, keyword),
+            headers: {
+                ...pinterestHeaders(ua, keyword),
+                'x-pinterest-pws-handler': 'www/[username].js',
+            },
         });
 
-        const guides = res.data?.resource_response?.data?.guides ?? [];
+        const suggestions = res.data?.resource_response?.data?.queries ?? [];
 
         // Keep only style/format modifiers — reject proper nouns (capital letters)
         // and multi-word phrases that are likely a different franchise or character.
-        const terms = guides
-            .map(g => g?.display_name || g?.term)
+        const terms = suggestions
+            .map(g => g?.display_name || g?.query)
             .filter(Boolean)
             .filter(t => {
-                const words = t.trim().split(/\s+/);
-                // Skip if more than 2 words (likely a character/show name)
+                const norm = t.trim().toLowerCase();
+                // Must start with the keyword (true autocomplete)
+                if (!norm.startsWith(keyword.toLowerCase())) return false;
+                // Extract the extra suffix after the keyword
+                const suffix = norm.slice(keyword.toLowerCase().length).trim();
+                if (!suffix) return false;
+                const words = suffix.split(/\s+/);
+                // Skip if more than 2 extra words
                 if (words.length > 2) return false;
-                // Skip if any word starts with uppercase (likely a proper noun)
+                // Skip if any extra word starts with uppercase (likely a proper noun)
                 if (words.some(w => /^[A-Z]/.test(w))) return false;
-                // Skip if the term already appears in the keyword (redundant)
-                if (keyword.toLowerCase().includes(t.toLowerCase())) return false;
                 return true;
             })
             .slice(0, 5);
 
         if (terms.length > 0) {
-            const variants = [keyword, ...terms.map(t => `${keyword} ${t}`)];
+            const variants = [keyword, ...terms];
             guidedCache[keyword] = variants;
             console.log(`🔍 Guides for "${keyword}": ${terms.join(', ')}`);
             return variants;
@@ -1068,6 +1189,110 @@ async function replyError(interaction, now, description) {
     } catch {}
 }
 
+// ========== Request Channel — Pinterest URL Listener ==========
+pinterestBot.on('messageCreate', async (message) => {
+    if (message.author.bot) return;
+    if (!REQUEST_CHANNEL_ID || message.channelId !== REQUEST_CHANNEL_ID) return;
+
+    const urlMatch = message.content.match(/https?:\/\/(?:pin\.it\/\S+|(?:www\.)?pinterest\.com\/pin\/\d+[^\s]*)/i);
+    if (!urlMatch) return;
+
+    await message.react('⏳').catch(() => {});
+
+    const SPOILER = '|| بسبب مدة انتهى ازرار تفاعلية بمدة محدودة نسهل عليكم البحث بدل ما يقولو لك كاروسيل منتهي ||';
+    const MAX_SIZE = 8 * 1024 * 1024;
+
+    try {
+        const resolved = await resolvePinUrl(urlMatch[0]);
+        const pinId    = extractPinId(resolved);
+        if (!pinId) throw new Error('تعذّر استخراج معرّف الصورة من الرابط');
+
+        const pin     = await fetchPinById(pinId);
+        const keyword = pin?.title || pin?.grid_title || 'طلب مباشر';
+
+        const videoUrl      = bestVideoUrl(pin?.videos?.video_list);
+        const carouselSlots = pin?.carousel_data?.carousel_slots;
+
+        if (!videoUrl && carouselSlots?.length > 1) {
+            // ── Carousel ───────────────────────────────────────
+            const urls  = carouselSlots.map(s => bestImageUrl(s?.images)).filter(Boolean).map(upgradeToOriginals);
+            const files = [];
+            for (let i = 0; i < Math.min(urls.length, 10); i++) {
+                try {
+                    const dl = await downloadImage(urls[i]);
+                    let { buffer, format } = dl;
+                    if (dl.size > MAX_SIZE) {
+                        buffer = await sharp(buffer).resize({ width: 1280, withoutEnlargement: true }).jpeg({ quality: 85 }).toBuffer();
+                        format = 'jpg';
+                    }
+                    files.push(new AttachmentBuilder(buffer, { name: `carousel_${i + 1}.${format}` }));
+                } catch { /* skip failed */ }
+            }
+            if (files.length === 0) throw new Error('فشل تحميل جميع الصور');
+
+            if (files.length === 1) {
+                // Single fallback
+                const imgName = files[0].name;
+                const sent = await message.reply({ allowedMentions: { repliedUser: false },
+                    embeds: [new EmbedBuilder().setTitle('Avatar — Pinterest').setDescription(`🔍 \`${keyword}\``).setImage(`attachment://${imgName}`).setColor('#E60023')],
+                    files: [files[0]] });
+                const att = sent.attachments.find(a => a.name === imgName);
+                if (att) await sent.edit({ embeds: [new EmbedBuilder().setTitle('Avatar — Pinterest').setDescription(`🔍 \`${keyword}\``).setURL(att.url).setImage(`attachment://${imgName}`).setColor('#E60023')],
+                    components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setLabel('🖼️ Image').setURL(att.url).setStyle(ButtonStyle.Link))] });
+            } else {
+                const sent = await message.reply({ content: SPOILER, allowedMentions: { repliedUser: false },
+                    embeds: [new EmbedBuilder().setTitle('Avatars — Pinterest').setDescription(`🔍 \`${keyword}\``).setColor('#E60023')],
+                    components: buildCarouselComponents('placeholder', 0, files.length), files });
+                const attByName = new Map([...sent.attachments.values()].map(a => [a.name, a.url]));
+                const cdnUrls   = files.map(f => attByName.get(f.name)).filter(Boolean);
+                const total     = cdnUrls.length;
+                if (total > 0) {
+                    await sent.edit({ embeds: [buildCarouselEmbed(cdnUrls[0], keyword, 0, total)], components: buildCarouselComponents(sent.id, 0, total) });
+                    carouselSessions.set(sent.id, { cdnUrls, page: 0, keyword, total });
+                    const _eId = sent.id, _eCh = sent.channelId;
+                    setTimeout(async () => {
+                        carouselSessions.delete(_eId);
+                        try {
+                            const ch  = await pinterestBot.channels.fetch(_eCh);
+                            const msg = await ch.messages.fetch(_eId);
+                            await msg.edit({ content: SPOILER, components: [] });
+                        } catch {}
+                    }, 30 * 60 * 1000);
+                }
+            }
+        } else {
+            // ── Single image or video ───────────────────────────
+            const rawUrl = videoUrl || upgradeToOriginals(bestImageUrl(pin?.images) ?? '');
+            if (!rawUrl) throw new Error('لم يتم العثور على صورة في هذا الرابط');
+            let { buffer, format, size } = await downloadImage(rawUrl);
+            if (VIDEO_EXTS.has(format)) { buffer = await videoToGif(buffer, format); format = 'gif'; }
+            else if (size > MAX_SIZE) {
+                buffer = await sharp(buffer).resize({ width: 1280, withoutEnlargement: true }).jpeg({ quality: 85 }).toBuffer();
+                format = 'jpg';
+            }
+            const imgName = `anime.${format}`;
+            const sent = await message.reply({ allowedMentions: { repliedUser: false },
+                embeds: [new EmbedBuilder().setTitle('Avatar — Pinterest').setDescription(`🔍 \`${keyword}\``).setImage(`attachment://${imgName}`).setColor('#E60023')],
+                files: [new AttachmentBuilder(buffer, { name: imgName })] });
+            const att = sent.attachments.find(a => a.name === imgName);
+            if (att) await sent.edit({ embeds: [new EmbedBuilder().setTitle('Avatar — Pinterest').setDescription(`🔍 \`${keyword}\``).setURL(att.url).setImage(`attachment://${imgName}`).setColor('#E60023')],
+                components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setLabel('🖼️ Image').setURL(att.url).setStyle(ButtonStyle.Link))] });
+        }
+
+        await message.reactions.cache.get('⏳')?.remove().catch(() => {});
+        await message.react('✅').catch(() => {});
+
+    } catch (err) {
+        console.error(`❌ Request channel: ${err.message}`);
+        await message.reactions.cache.get('⏳')?.remove().catch(() => {});
+        await message.react('❌').catch(() => {});
+        await message.reply({
+            embeds: [new EmbedBuilder().setColor('#ED4245').setDescription(`❌ فشل تحميل الصورة\n\`${err.message}\``)],
+            allowedMentions: { repliedUser: false },
+        }).catch(() => {});
+    }
+});
+
 // ========== Carousel Button Handler ==========
 pinterestBot.on('interactionCreate', async (interaction) => {
     if (!interaction.isButton()) return;
@@ -1079,7 +1304,14 @@ pinterestBot.on('interactionCreate', async (interaction) => {
     const session     = carouselSessions.get(sessionId);
 
     if (!session) {
-        return interaction.reply({ content: '⏱️ انتهت صلاحية هذا الكاروسيل.', ephemeral: true });
+        return interaction.reply({
+            embeds: [new EmbedBuilder()
+                .setColor('#FEE75C')
+                .setTitle('⏱️ انتهت صلاحية الكاروسيل')
+                .setDescription('هذا الكاروسيل انتهت صلاحيته — الأزرار تعمل لمدة **30 دقيقة** فقط بعد النشر.')
+            ],
+            ephemeral: true
+        });
     }
 
     session.page = isPrev
@@ -1087,8 +1319,9 @@ pinterestBot.on('interactionCreate', async (interaction) => {
         : Math.min(session.total - 1, session.page + 1);
 
     try {
+        const currentUrl = session.cdnUrls[session.page];
         await interaction.update({
-            embeds:     [buildCarouselEmbed(session.cdnUrls[session.page], session.keyword, session.page, session.total)],
+            embeds:     [buildCarouselEmbed(currentUrl, session.keyword, session.page, session.total)],
             components: buildCarouselComponents(sessionId, session.page, session.total),
         });
     } catch (err) {
@@ -1259,7 +1492,7 @@ pinterestBot.on('interactionCreate', async (interaction) => {
         }).catch(() => {});
 
         const modeEmoji = keywordMode === 'random' ? '🎲' : '🔁';
-        const kwList    = keywords.map((k, i) => `> \`${String(i + 1).padStart(2, '0')}.\` ${k}${k === kw ? '  ← **new**' : ''}`).join('\n');
+        const kwList    = keywords.map((k, i) => `> \`${String(i + 1).padStart(2, '0')}.\` ${k}${k === kw ? '  ← **new**' : ''}`).join('\n').slice(0, 1024);
 
         await interaction.reply({
             embeds: [new EmbedBuilder()
@@ -1472,7 +1705,7 @@ pinterestBot.on('interactionCreate', async (interaction) => {
             if (n > 0) { saveState(); console.log(`  ✅ Pre-fetched ${n} from edited keyword "${newKw}"`); }
         }).catch(() => {});
 
-        const kwList = keywords.map((k, i) => `> \`${String(i + 1).padStart(2, '0')}.\` ${k}${i === idx ? '  ← **edited**' : ''}`).join('\n').slice(0, 1024);
+        const kwList = keywords.map((k, i) => `> \`${String(i + 1).padStart(2, '0')}.\` ${k}${i === idx ? '  ← **edited**' : ''}`).join('\n').slice(0, 1024) || '> *No keywords set*';
 
         await interaction.reply({
             embeds: [new EmbedBuilder()
@@ -1598,12 +1831,12 @@ pinterestBot.once('ready', async () => {
     await fillQueue();
 
     // First post after 5 seconds
-    setTimeout(() => updatePinterestAvatar(), 5000);
-    setInterval(updatePinterestAvatar, PINTEREST_CHANGE_INTERVAL * 1000);
+    setTimeout(() => updatePinterestAvatar().catch(err => console.error(`❌ Post error: ${err.message}`)), 5000);
+    setInterval(() => updatePinterestAvatar().catch(err => console.error(`❌ Post error: ${err.message}`)), PINTEREST_CHANGE_INTERVAL * 1000);
 
     // Periodic refill every 10 minutes regardless of queue level
     setInterval(() => {
-        if (!isFetching) fillQueue().catch(() => {});
+        if (!_fillQueuePromise) fillQueue().catch(() => {});
     }, 10 * 60 * 1000);
 });
 
